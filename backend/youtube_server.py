@@ -26,6 +26,7 @@ SLOTS = threading.BoundedSemaphore(4)
 INFO_SLOTS = threading.BoundedSemaphore(2)
 TTL = 3600
 MAX_BYTES = int(os.environ.get('MAX_FILE_BYTES', str(6 * 1024**3)))
+CONNECTION = {}
 TOKEN = os.environ.get('MEDIAHARBOR_BACKEND_TOKEN', '')
 
 
@@ -195,6 +196,12 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return self.send_json({'error': 'Unauthorized'}, 401)
         try:
+            if path.path == '/connection':
+                with LOCK:
+                    connection = dict(CONNECTION)
+                if not connection or time.time() - connection.get('updated', 0) > 180:
+                    return self.send_json({'error': 'The computer helper is offline. Start the MediaHarbor YouTube helper on your computer.'}, 503)
+                return self.send_json({'origin': connection['origin']})
             if path.path == '/info':
                 return self.send_json(info(parse_qs(path.query).get('url', [''])[0]))
             match = re.fullmatch(r'/jobs/([0-9a-f]{32})(/file)?', path.path)
@@ -214,6 +221,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authorized():
             return self.send_json({'error': 'Unauthorized'}, 401)
+        if self.path == '/register':
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                if not 0 < length <= 4096:
+                    raise ValueError('Invalid request size.')
+                data = json.loads(self.rfile.read(length))
+                u = urlparse(data.get('origin', ''))
+                if u.scheme != 'https' or not re.fullmatch(r'[a-z0-9-]+\.trycloudflare\.com', u.hostname or '') or u.port or u.username or u.password or u.path not in ('', '/') or u.query or u.fragment:
+                    raise ValueError('Invalid helper origin.')
+                with LOCK:
+                    CONNECTION.update(origin='https://' + u.hostname, updated=time.time())
+                return self.send_json({'ok': True})
+            except Exception:
+                return self.send_json({'error': 'Invalid helper registration.'}, 400)
         if self.path != '/jobs':
             return self.send_json({'error': 'Not found'}, 404)
         try:

@@ -1,0 +1,46 @@
+import importlib.util
+import json
+import os
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+scratch=tempfile.TemporaryDirectory(prefix='mediaharbor-test-')
+os.environ['DATA_DIR']=scratch.name
+os.environ['MEDIAHARBOR_BACKEND_TOKEN']='unit-test-token-not-a-real-credential-12345'
+spec=importlib.util.spec_from_file_location('service',Path(__file__).with_name('youtube_server.py'))
+service=importlib.util.module_from_spec(spec);spec.loader.exec_module(service)
+
+class BackendTests(unittest.TestCase):
+    def test_url_boundary(self):
+        for url in ['https://www.youtube.com/watch?v=ak-Ei831dtk','https://youtu.be/ak-Ei831dtk','https://m.youtube.com/shorts/ak-Ei831dtk']:
+            self.assertEqual(service.video_id(url),'ak-Ei831dtk')
+        for url in ['https://youtube.com.evil.com/watch?v=ak-Ei831dtk','http://127.0.0.1/','https://user:pass@youtube.com/watch?v=ak-Ei831dtk','https://youtube.com/watch?v=bad']:
+            with self.assertRaises(ValueError):service.video_id(url)
+    def test_quality_cannot_exceed_available_source(self):
+        with patch.object(service,'info',return_value={'qualities':[1080,720], 'title':'test','videoId':'ak-Ei831dtk'}):
+            with self.assertRaises(ValueError):service.create_job('https://youtu.be/ak-Ei831dtk','2160')
+    def test_private_errors(self):
+        self.assertNotIn('googlevideo',service.friendly_error('failed https://googlevideo.com/secret'))
+    def test_authentication_and_range(self):
+        job_id='a'*32;folder=Path(scratch.name)/job_id;folder.mkdir(exist_ok=True);(folder/'video.mp4').write_bytes(b'0123456789'*1024)
+        service.JOBS[job_id]={'id':job_id,'status':'ready','videoId':'ak-Ei831dtk','height':2160,'updated':0}
+        server=service.ThreadingHTTPServer(('127.0.0.1',0),service.Handler)
+        threading.Thread(target=server.serve_forever,daemon=True).start()
+        base='http://127.0.0.1:'+str(server.server_port)
+        try:
+            with self.assertRaises(HTTPError) as error:urlopen(base+'/info?url=x')
+            self.assertEqual(error.exception.code,401)
+            req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=10-19'})
+            with urlopen(req) as response:
+                self.assertEqual(response.status,206);self.assertEqual(response.read(),b'0123456789');self.assertEqual(response.headers['Content-Range'],'bytes 10-19/10240')
+            req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=999999-'})
+            with self.assertRaises(HTTPError) as error:urlopen(req)
+            self.assertEqual(error.exception.code,416)
+        finally:server.shutdown();server.server_close()
+
+if __name__=='__main__':unittest.main()
