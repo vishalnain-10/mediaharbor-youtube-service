@@ -1,8 +1,10 @@
 import importlib.util
 import json
 import os
+import re
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +26,21 @@ class BackendTests(unittest.TestCase):
     def test_quality_cannot_exceed_available_source(self):
         with patch.object(service,'info',return_value={'qualities':[1080,720], 'title':'test','videoId':'ak-Ei831dtk'}):
             with self.assertRaises(ValueError):service.create_job('https://youtu.be/ak-Ei831dtk','2160')
+    def test_sizes_use_selected_tracks_not_stale_downloads(self):
+        class FakeYDL:
+            def __init__(self, options): self.options = options
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def process_ie_result(self, data, download=False):
+                cap = int(re.search(r'height<=(\d+)', self.options['format'])[1])
+                return {'requested_formats': [{'filesize': cap * 1000}, {'filesize': 100}], 'requested_downloads': [{'filesize': 999}]}
+        with patch.dict('sys.modules', {'yt_dlp': types.SimpleNamespace(YoutubeDL=FakeYDL)}):
+            self.assertEqual(service.quality_sizes({'duration':60}, [2160,360]), {'2160':2160100,'360':360100})
+    def test_stream_size(self):
+        self.assertEqual(service.stream_bytes({'filesize': 1200, 'tbr': 100}, 60), 1200)
+        self.assertEqual(service.stream_bytes({'filesize_approx': 2300}, 60), 2300)
+        self.assertEqual(service.stream_bytes({'tbr': 100}, 60), 750000)
+        self.assertIsNone(service.stream_bytes({}, 60))
     def test_private_errors(self):
         self.assertNotIn('googlevideo',service.friendly_error('failed https://googlevideo.com/secret'))
     def test_authentication_and_range(self):

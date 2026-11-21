@@ -1,4 +1,5 @@
 """Private yt-dlp/FFmpeg job service. Only the Sites server holds its API key."""
+import copy
 import concurrent.futures
 import contextlib
 import hmac
@@ -64,6 +65,33 @@ def friendly_error(text):
     return 'YouTube could not prepare this video. It may be unavailable, restricted, or temporarily blocking this server.'
 
 
+def stream_bytes(stream, duration):
+    size = stream.get('filesize') or stream.get('filesize_approx')
+    if size and size > 0:
+        return int(size)
+    rate = stream.get('tbr')
+    return int(rate * 1000 * duration / 8) if rate and duration else None
+
+
+def quality_sizes(data, heights):
+    from yt_dlp import YoutubeDL
+    sizes = {}
+    for height in heights:
+        options = {'quiet': True, 'no_warnings': True, 'skip_download': True,
+                   'format': f'bestvideo[height<={height}]+bestaudio/best[height<={height}]',
+                   'format_sort': ['res', 'ext:mp4:m4a']}
+        try:
+            with YoutubeDL(options) as ydl:
+                selected = ydl.process_ie_result(copy.deepcopy(data), download=False)
+            chosen = selected
+            streams = chosen.get('requested_formats') or [chosen]
+            values = [stream_bytes(stream, data.get('duration')) for stream in streams]
+            sizes[str(height)] = sum(values) if values and all(value is not None for value in values) else None
+        except Exception:
+            sizes[str(height)] = None
+    return sizes
+
+
 def info(value):
     vid = video_id(value)
     with LOCK:
@@ -84,7 +112,7 @@ def info(value):
         heights = sorted({int(f['height']) for f in data.get('formats', []) if f.get('height') and f.get('vcodec') != 'none' and f.get('height') <= 2160}, reverse=True)
         if not heights:
             raise ValueError('No downloadable video formats are available for this video.')
-        output = {'videoId': vid, 'title': data.get('title', vid), 'thumbnail': 'https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg', 'duration': data.get('duration'), 'qualities': heights, 'sourceUrl': 'https://www.youtube.com/watch?v=' + vid}
+        output = {'videoId': vid, 'title': data.get('title', vid), 'thumbnail': 'https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg', 'duration': data.get('duration'), 'qualities': heights, 'qualitySizes': quality_sizes(data, heights), 'sourceUrl': 'https://www.youtube.com/watch?v=' + vid}
         with LOCK:
             if len(CACHE) > 100:
                 CACHE.clear()
