@@ -92,6 +92,22 @@ def quality_sizes(data, heights):
     return sizes
 
 
+def audio_options(data):
+    from yt_dlp import YoutubeDL
+    duration = data.get('duration') or 0
+    options = [{'id': f'mp3-{rate}', 'format': 'mp3', 'bitrate': rate,
+                'label': f'MP3 · {rate} kbps', 'estimatedSize': int(duration * rate * 1000 / 8) or None}
+               for rate in (128, 192, 320)]
+    try:
+        with YoutubeDL({'quiet': True, 'no_warnings': True, 'skip_download': True, 'format': 'bestaudio[ext=m4a]/bestaudio'}) as ydl:
+            selected = ydl.process_ie_result(copy.deepcopy(data), download=False)
+        size = stream_bytes(selected, duration)
+        options.append({'id': 'm4a', 'format': 'm4a', 'label': 'M4A · source quality', 'estimatedSize': size})
+    except Exception:
+        pass
+    return options
+
+
 def info(value):
     vid = video_id(value)
     with LOCK:
@@ -112,7 +128,7 @@ def info(value):
         heights = sorted({int(f['height']) for f in data.get('formats', []) if f.get('height') and f.get('vcodec') != 'none' and f.get('height') <= 2160}, reverse=True)
         if not heights:
             raise ValueError('No downloadable video formats are available for this video.')
-        output = {'videoId': vid, 'title': data.get('title', vid), 'thumbnail': 'https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg', 'duration': data.get('duration'), 'qualities': heights, 'qualitySizes': quality_sizes(data, heights), 'sourceUrl': 'https://www.youtube.com/watch?v=' + vid}
+        output = {'videoId': vid, 'title': data.get('title', vid), 'thumbnail': 'https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg', 'duration': data.get('duration'), 'qualities': heights, 'qualitySizes': quality_sizes(data, heights), 'audioOptions': audio_options(data), 'sourceUrl': 'https://www.youtube.com/watch?v=' + vid}
         with LOCK:
             if len(CACHE) > 100:
                 CACHE.clear()
@@ -127,14 +143,21 @@ def set_job(job_id, **changes):
         JOBS[job_id].update(changes, updated=time.time())
 
 
-def prepare(job_id, vid, height):
+def prepare(job_id, vid, height, mode='video', audio_format='mp3', bitrate=192):
     folder = ROOT / job_id
     proc = None
     try:
         folder.mkdir()
         set_job(job_id, status='downloading', progress=0)
-        selection = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
-        args = base_args() + ['--newline', '--no-simulate', '--max-filesize', str(MAX_BYTES), '-f', selection, '-S', 'res,ext:mp4:m4a', '--merge-output-format', 'mp4', '--remux-video', 'mp4', '--progress-template', 'download:MH:%(progress._percent_str)s', '-o', str(folder / 'video.%(ext)s'), 'https://www.youtube.com/watch?v=' + vid]
+        audio = mode == 'audio'
+        extension = audio_format if audio else 'mp4'
+        if audio:
+            selection = 'bestaudio[ext=m4a]/bestaudio' if audio_format == 'm4a' else 'bestaudio/best'
+            conversion = ['--extract-audio', '--audio-format', audio_format, '--audio-quality', str(bitrate) + 'K' if audio_format == 'mp3' else '0']
+        else:
+            selection = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
+            conversion = ['-S', 'res,ext:mp4:m4a', '--merge-output-format', 'mp4', '--remux-video', 'mp4']
+        args = base_args() + ['--newline', '--no-simulate', '--max-filesize', str(MAX_BYTES), '-f', selection] + conversion + ['--progress-template', 'download:MH:%(progress._percent_str)s', '-o', str(folder / ('audio.%(ext)s' if audio else 'video.%(ext)s')), 'https://www.youtube.com/watch?v=' + vid]
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
         timed_out = threading.Event()
         def expire():
@@ -150,8 +173,8 @@ def prepare(job_id, vid, height):
                 if match:
                     # yt-dlp reports each track separately; avoid a misleading combined percentage.
                     set_job(job_id, progress=min(100, float(match[1])), stage='Downloading media track')
-                elif '[Merger]' in line or '[VideoRemuxer]' in line:
-                    set_job(job_id, status='merging', progress=None, stage='Combining video and audio')
+                elif '[Merger]' in line or '[VideoRemuxer]' in line or '[ExtractAudio]' in line:
+                    set_job(job_id, status='merging', progress=None, stage='Preparing audio file' if audio else 'Combining video and audio')
                 if sum(p.stat().st_size for p in folder.glob('*') if p.is_file()) > MAX_BYTES * 2:
                     proc.kill()
                     raise ValueError('The download exceeds this service’s temporary storage limit. Choose a lower quality.')
@@ -162,9 +185,9 @@ def prepare(job_id, vid, height):
             raise ValueError('The download timed out. Try a lower quality.')
         if code:
             raise ValueError(friendly_error(recent))
-        file = folder / 'video.mp4'
+        file = folder / (('audio.' if audio else 'video.') + extension)
         if not file.is_file() or file.stat().st_size < 1024:
-            raise ValueError('No completed MP4 file was produced.')
+            raise ValueError('No completed media file was produced.')
         if file.stat().st_size > MAX_BYTES:
             raise ValueError('The completed file is too large. Choose a lower quality.')
         set_job(job_id, status='ready', progress=100, size=file.stat().st_size, stage='Ready to download')
@@ -176,17 +199,21 @@ def prepare(job_id, vid, height):
         SLOTS.release()
 
 
-def create_job(value, quality):
+def create_job(value, quality, mode='video', audio_format='mp3', bitrate=192):
+    if mode not in ('audio', 'video'):
+        raise ValueError('Choose video or audio-only download.')
+    if mode == 'audio' and (audio_format not in ('mp3', 'm4a') or bitrate not in (128, 192, 320)):
+        raise ValueError('Choose MP3 at 128, 192, or 320 kbps, or M4A.')
     data = info(value)
-    cap = max(data['qualities']) if quality == 'original' else int(quality)
-    if cap not in data['qualities'] or cap > 2160:
+    cap = None if mode == 'audio' else max(data['qualities']) if quality == 'original' else int(quality)
+    if mode == 'video' and (cap not in data['qualities'] or cap > 2160):
         raise ValueError('Choose one of the video’s available resolutions, up to 2160p.')
     if not SLOTS.acquire(blocking=False):
         raise ValueError('The download queue is full. Please try again shortly.')
     job_id = uuid.uuid4().hex
     with LOCK:
-        JOBS[job_id] = {'id': job_id, 'status': 'queued', 'progress': None, 'height': cap, 'title': data['title'], 'videoId': data['videoId'], 'created': time.time(), 'updated': time.time()}
-    POOL.submit(prepare, job_id, data['videoId'], cap)
+        JOBS[job_id] = {'id': job_id, 'status': 'queued', 'progress': None, 'height': cap, 'mode': mode, 'extension': audio_format if mode == 'audio' else 'mp4', 'bitrate': bitrate if mode == 'audio' and audio_format == 'mp3' else None, 'title': data['title'], 'videoId': data['videoId'], 'created': time.time(), 'updated': time.time()}
+    POOL.submit(prepare, job_id, data['videoId'], cap, mode, audio_format, bitrate)
     return job(job_id)
 
 
@@ -270,14 +297,16 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length <= 4096:
                 raise ValueError('Invalid request size.')
             data = json.loads(self.rfile.read(length))
-            self.send_json(create_job(data.get('url', ''), str(data.get('quality', 'original'))), 202)
+            self.send_json(create_job(data.get('url', ''), str(data.get('quality', 'original')), data.get('mode', 'video'), data.get('audioFormat', 'mp3'), int(data.get('bitrate', 192))), 202)
         except (ValueError, TypeError, subprocess.TimeoutExpired) as error:
             self.send_json({'error': str(error) if isinstance(error, ValueError) else 'Could not prepare this video.'}, 400)
         except Exception:
             self.send_json({'error': 'Could not start the download.'}, 500)
 
     def send_file(self, job_id, data):
-        file = ROOT / job_id / 'video.mp4'
+        audio = data.get('mode') == 'audio'
+        extension = data.get('extension', 'mp4')
+        file = ROOT / job_id / (('audio.' if audio else 'video.') + extension)
         size = file.stat().st_size
         start, end = 0, size - 1
         range_header = self.headers.get('Range')
@@ -292,9 +321,10 @@ class Handler(BaseHTTPRequestHandler):
             if start > end or start >= size:
                 return self.send_json({'error': 'Range is outside this file.'}, 416)
         self.send_response(206 if range_header else 200)
-        self.send_header('Content-Type', 'video/mp4')
+        self.send_header('Content-Type', {'mp3': 'audio/mpeg', 'm4a': 'audio/mp4', 'mp4': 'video/mp4'}[extension])
         self.send_header('Content-Length', str(end - start + 1))
-        self.send_header('Content-Disposition', 'attachment; filename="youtube-' + data['videoId'] + '-' + str(data['height']) + 'p.mp4"')
+        suffix = (str(data.get('bitrate')) + 'kbps' if data.get('bitrate') else 'audio') if audio else str(data['height']) + 'p'
+        self.send_header('Content-Disposition', 'attachment; filename="youtube-' + data['videoId'] + '-' + suffix + '.' + extension + '"')
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('Cache-Control', 'no-store')
         if range_header:

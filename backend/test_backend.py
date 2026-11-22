@@ -41,6 +41,24 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(service.stream_bytes({'filesize_approx': 2300}, 60), 2300)
         self.assertEqual(service.stream_bytes({'tbr': 100}, 60), 750000)
         self.assertIsNone(service.stream_bytes({}, 60))
+    def test_audio_validation_and_queue(self):
+        with self.assertRaises(ValueError):service.create_job('https://youtu.be/ak-Ei831dtk','original','audio','flac',192)
+        with patch.object(service,'info',return_value={'qualities':[1080], 'title':'test','videoId':'ak-Ei831dtk'}), patch.object(service.POOL,'submit') as submit:
+            try:
+                queued=service.create_job('https://youtu.be/ak-Ei831dtk','original','audio','mp3',192)
+                self.assertEqual(queued['mode'],'audio');self.assertEqual(queued['extension'],'mp3');self.assertIsNone(queued['height'])
+                self.assertEqual(submit.call_args.args[-3:],('audio','mp3',192))
+            finally:service.SLOTS.release()
+    def test_audio_size_options(self):
+        class FakeYDL:
+            def __init__(self, options): pass
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def process_ie_result(self, data, download=False): return {'filesize':12345}
+        with patch.dict('sys.modules', {'yt_dlp':types.SimpleNamespace(YoutubeDL=FakeYDL)}):
+            options=service.audio_options({'duration':60})
+        self.assertEqual([x['id'] for x in options],['mp3-128','mp3-192','mp3-320','m4a'])
+        self.assertEqual(options[1]['estimatedSize'],1440000);self.assertEqual(options[3]['estimatedSize'],12345)
     def test_private_errors(self):
         self.assertNotIn('googlevideo',service.friendly_error('failed https://googlevideo.com/secret'))
     def test_authentication_and_range(self):
@@ -58,6 +76,11 @@ class BackendTests(unittest.TestCase):
             req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=999999-'})
             with self.assertRaises(HTTPError) as error:urlopen(req)
             self.assertEqual(error.exception.code,416)
+            service.JOBS[job_id].update(mode='audio',extension='mp3',bitrate=192)
+            (folder/'audio.mp3').write_bytes(b'audio-test'*1000)
+            req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=0-9'})
+            with urlopen(req) as response:
+                self.assertEqual(response.status,206);self.assertEqual(response.headers['Content-Type'],'audio/mpeg');self.assertIn('192kbps.mp3',response.headers['Content-Disposition']);self.assertEqual(response.read(),b'audio-test')
         finally:server.shutdown();server.server_close()
 
 if __name__=='__main__':unittest.main()
