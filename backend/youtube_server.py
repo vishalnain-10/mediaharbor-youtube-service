@@ -4,6 +4,7 @@ import concurrent.futures
 import contextlib
 import hmac
 import json
+from email.utils import formatdate
 import os
 import re
 import shutil
@@ -138,16 +139,58 @@ def info(value):
         INFO_SLOTS.release()
 
 
+def media_path(data):
+    extension = data.get('extension', 'mp4')
+    if extension not in ('mp3', 'm4a', 'mp4') or not re.fullmatch(r'[0-9a-f]{32}', data.get('id', '')):
+        raise ValueError('Invalid prepared file metadata.')
+    return ROOT / data['id'] / (('audio.' if data.get('mode') == 'audio' else 'video.') + extension)
+
+
+def folder_bytes(folder):
+    total = 0
+    for file in folder.iterdir():
+        try:
+            if file.is_file(): total += file.stat().st_size
+        except FileNotFoundError:
+            # yt-dlp atomically renames .part files while progress is read.
+            continue
+    return total
+
+
+def persist_ready(data):
+    if data.get('status') != 'ready': return
+    try:
+        file = ROOT / data['id'] / 'job.json'
+        file.write_text(json.dumps({key:value for key,value in data.items() if key != 'activeStreams'}), encoding='utf-8')
+    except OSError:
+        pass
+
+
+def recover_ready_jobs():
+    for state in ROOT.glob('*/job.json'):
+        try:
+            data = json.loads(state.read_text(encoding='utf-8'))
+            if data.get('id') != state.parent.name or data.get('status') != 'ready' or time.time() - data.get('updated', 0) > TTL:
+                continue
+            file = media_path(data)
+            if file.is_file() and file.stat().st_size == data.get('size'):
+                JOBS[data['id']] = data
+        except (OSError, ValueError, TypeError):
+            continue
+
+
 def set_job(job_id, **changes):
     with LOCK:
         JOBS[job_id].update(changes, updated=time.time())
+        state = dict(JOBS[job_id])
+    persist_ready(state)
 
 
 def prepare(job_id, vid, height, mode='video', audio_format='mp3', bitrate=192):
     folder = ROOT / job_id
     proc = None
     try:
-        folder.mkdir()
+        folder.mkdir(exist_ok=True)
         set_job(job_id, status='downloading', progress=0)
         audio = mode == 'audio'
         extension = audio_format if audio else 'mp4'
@@ -175,7 +218,7 @@ def prepare(job_id, vid, height, mode='video', audio_format='mp3', bitrate=192):
                     set_job(job_id, progress=min(100, float(match[1])), stage='Downloading media track')
                 elif '[Merger]' in line or '[VideoRemuxer]' in line or '[ExtractAudio]' in line:
                     set_job(job_id, status='merging', progress=None, stage='Preparing audio file' if audio else 'Combining video and audio')
-                if sum(p.stat().st_size for p in folder.glob('*') if p.is_file()) > MAX_BYTES * 2:
+                if folder_bytes(folder) > MAX_BYTES * 2:
                     proc.kill()
                     raise ValueError('The download exceeds this service’s temporary storage limit. Choose a lower quality.')
             code = proc.wait()
@@ -194,6 +237,7 @@ def prepare(job_id, vid, height, mode='video', audio_format='mp3', bitrate=192):
     except Exception as error:
         if proc and proc.poll() is None:
             proc.kill()
+        print(json.dumps({'event':'download_failure','job':job_id,'exception':type(error).__name__,'errno':getattr(error,'errno',None)}),file=sys.stderr,flush=True)
         set_job(job_id, status='failed', error=str(error) if isinstance(error, ValueError) else 'The download failed. Try again.')
     finally:
         SLOTS.release()
@@ -208,8 +252,22 @@ def create_job(value, quality, mode='video', audio_format='mp3', bitrate=192):
     cap = None if mode == 'audio' else max(data['qualities']) if quality == 'original' else int(quality)
     if mode == 'video' and (cap not in data['qualities'] or cap > 2160):
         raise ValueError('Choose one of the video’s available resolutions, up to 2160p.')
+    with LOCK:
+        matching = [dict(existing) for existing in JOBS.values() if existing.get('videoId') == data['videoId'] and existing.get('mode', 'video') == mode and existing.get('height') == cap and existing.get('extension', 'mp4') == (audio_format if mode == 'audio' else 'mp4') and (mode != 'audio' or audio_format != 'mp3' or existing.get('bitrate') == bitrate)]
+    for existing in sorted(matching, key=lambda item:item.get('updated',0), reverse=True):
+        if existing['status'] == 'ready' and media_path(existing).is_file():
+            set_job(existing['id'])
+            return job(existing['id'])
+    for existing in matching:
+        if existing['status'] in ('queued','downloading','merging'):
+            return existing
     if not SLOTS.acquire(blocking=False):
         raise ValueError('The download queue is full. Please try again shortly.')
+    failed = next((existing for existing in sorted(matching,key=lambda item:item.get('updated',0),reverse=True) if existing['status']=='failed' and (ROOT/existing['id']).is_dir()),None)
+    if failed:
+        set_job(failed['id'],status='queued',progress=None,error=None,stage='Resuming preparation')
+        POOL.submit(prepare,failed['id'],data['videoId'],cap,mode,audio_format,bitrate)
+        return job(failed['id'])
     job_id = uuid.uuid4().hex
     with LOCK:
         JOBS[job_id] = {'id': job_id, 'status': 'queued', 'progress': None, 'height': cap, 'mode': mode, 'extension': audio_format if mode == 'audio' else 'mp4', 'bitrate': bitrate if mode == 'audio' and audio_format == 'mp3' else None, 'title': data['title'], 'videoId': data['videoId'], 'created': time.time(), 'updated': time.time()}
@@ -268,6 +326,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({'error': 'This file is not ready.'}, 409)
                 return self.send_file(match[1], data)
             self.send_json({'error': 'Not found'}, 404)
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
         except (ValueError, subprocess.TimeoutExpired) as error:
             self.send_json({'error': str(error) if isinstance(error, ValueError) else 'YouTube took too long to respond. Try again.'}, 400)
         except Exception:
@@ -306,10 +366,14 @@ class Handler(BaseHTTPRequestHandler):
     def send_file(self, job_id, data):
         audio = data.get('mode') == 'audio'
         extension = data.get('extension', 'mp4')
-        file = ROOT / job_id / (('audio.' if audio else 'video.') + extension)
-        size = file.stat().st_size
+        file = media_path(data)
+        stat = file.stat()
+        size = stat.st_size
+        etag = '"' + job_id + '-' + str(size) + '"'
+        modified = formatdate(stat.st_mtime,usegmt=True)
         start, end = 0, size - 1
         range_header = self.headers.get('Range')
+        if self.headers.get('If-Range') and self.headers['If-Range'] not in (etag,modified): range_header = None
         if range_header:
             match = re.fullmatch(r'bytes=(\d*)-(\d*)', range_header)
             if not match or not any(match.groups()):
@@ -326,26 +390,36 @@ class Handler(BaseHTTPRequestHandler):
         suffix = (str(data.get('bitrate')) + 'kbps' if data.get('bitrate') else 'audio') if audio else str(data['height']) + 'p'
         self.send_header('Content-Disposition', 'attachment; filename="youtube-' + data['videoId'] + '-' + suffix + '.' + extension + '"')
         self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('ETag', etag)
+        self.send_header('Last-Modified', modified)
         self.send_header('Cache-Control', 'no-store')
         if range_header:
             self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
         self.end_headers()
+        with LOCK:
+            JOBS[job_id]['activeStreams'] = JOBS[job_id].get('activeStreams',0) + 1
         set_job(job_id)
-        with file.open('rb') as stream:
-            stream.seek(start)
-            remaining = end - start + 1
-            while remaining:
-                chunk = stream.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    break
-                self.wfile.write(chunk);remaining -= len(chunk)
+        try:
+            with file.open('rb') as stream:
+                stream.seek(start)
+                remaining = end - start + 1
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk: break
+                    self.wfile.write(chunk);remaining -= len(chunk)
+        except (ConnectionResetError, BrokenPipeError):
+            self.close_connection = True
+        finally:
+            with LOCK:
+                JOBS[job_id]['activeStreams'] = max(0,JOBS[job_id].get('activeStreams',1)-1)
+            set_job(job_id)
 
 
 def cleanup():
     while True:
         time.sleep(60)
         with LOCK:
-            expired = [key for key, value in JOBS.items() if value['status'] in ('ready', 'failed') and time.time() - value['updated'] > TTL]
+            expired = [key for key, value in JOBS.items() if value['status'] in ('ready', 'failed') and not value.get('activeStreams') and time.time() - value['updated'] > TTL]
             for key in expired:
                 del JOBS[key]
         for key in expired:
@@ -357,5 +431,6 @@ def cleanup():
 if __name__ == '__main__':
     if len(TOKEN) < 32:
         raise SystemExit('MEDIAHARBOR_BACKEND_TOKEN must be set to at least 32 characters.')
+    recover_ready_jobs()
     threading.Thread(target=cleanup, daemon=True).start()
     ThreadingHTTPServer((os.environ.get('HOST', '0.0.0.0'), int(os.environ.get('PORT', '8080'))), Handler).serve_forever()

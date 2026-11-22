@@ -69,6 +69,24 @@ class BackendTests(unittest.TestCase):
         service.CACHE.clear();payload['duration']=43201
         with patch.object(service.subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout=json.dumps(payload))):
             with self.assertRaisesRegex(ValueError,'twelve hours'):service.info(url)
+    def test_progress_check_tolerates_part_file_rename(self):
+        transient=types.SimpleNamespace(is_file=lambda:True,stat=lambda:(_ for _ in ()).throw(FileNotFoundError()))
+        folder=types.SimpleNamespace(iterdir=lambda:iter([transient]))
+        self.assertEqual(service.folder_bytes(folder),0)
+    def test_completed_file_reused_and_recovered(self):
+        key='b'*32;folder=Path(scratch.name)/key;folder.mkdir(exist_ok=True);file=folder/'video.mp4';file.write_bytes(b'video'*256)
+        state={'id':key,'status':'ready','videoId':'HnRNXGKqNIE','mode':'video','height':1080,'extension':'mp4','size':file.stat().st_size,'updated':service.time.time()}
+        service.JOBS[key]=state;service.persist_ready(state)
+        with patch.object(service,'info',return_value={'qualities':[1080],'videoId':'HnRNXGKqNIE','title':'test'}),patch.object(service.POOL,'submit') as submit:
+            self.assertEqual(service.create_job('https://youtu.be/HnRNXGKqNIE','1080')['id'],key);submit.assert_not_called()
+        del service.JOBS[key];service.recover_ready_jobs();self.assertEqual(service.JOBS[key]['size'],1280)
+    def test_failed_job_resumes_existing_folder(self):
+        key='c'*32;(Path(scratch.name)/key).mkdir(exist_ok=True)
+        service.JOBS[key]={'id':key,'status':'failed','videoId':'HnRNXGKqNIE','mode':'video','height':720,'extension':'mp4','updated':0,'error':'old error'}
+        with patch.object(service,'info',return_value={'qualities':[720],'videoId':'HnRNXGKqNIE','title':'test'}),patch.object(service.POOL,'submit') as submit:
+            try:
+                result=service.create_job('https://youtu.be/HnRNXGKqNIE','720');self.assertEqual(result['id'],key);self.assertEqual(result['status'],'queued');self.assertIsNone(result['error']);self.assertEqual(submit.call_args.args[1],key)
+            finally:service.SLOTS.release();service.JOBS.pop(key,None)
     def test_private_errors(self):
         self.assertNotIn('googlevideo',service.friendly_error('failed https://googlevideo.com/secret'))
     def test_authentication_and_range(self):
@@ -82,7 +100,11 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(error.exception.code,401)
             req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=10-19'})
             with urlopen(req) as response:
-                self.assertEqual(response.status,206);self.assertEqual(response.read(),b'0123456789');self.assertEqual(response.headers['Content-Range'],'bytes 10-19/10240')
+                self.assertEqual(response.status,206);self.assertEqual(response.read(),b'0123456789');self.assertEqual(response.headers['Content-Range'],'bytes 10-19/10240');etag=response.headers['ETag']
+            req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=10-19','If-Range':etag})
+            with urlopen(req) as response:self.assertEqual(response.status,206);self.assertEqual(response.read(),b'0123456789')
+            req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=10-19','If-Range':'stale-etag'})
+            with urlopen(req) as response:self.assertEqual(response.status,200);self.assertEqual(len(response.read()),10240)
             req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=999999-'})
             with self.assertRaises(HTTPError) as error:urlopen(req)
             self.assertEqual(error.exception.code,416)
