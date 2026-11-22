@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import tempfile
 import threading
 import types
@@ -59,6 +60,15 @@ class BackendTests(unittest.TestCase):
             options=service.audio_options({'duration':60})
         self.assertEqual([x['id'] for x in options],['mp3-128','mp3-192','mp3-320','m4a'])
         self.assertEqual(options[1]['estimatedSize'],1440000);self.assertEqual(options[3]['estimatedSize'],12345)
+    def test_long_recorded_stream_and_duration_limit(self):
+        payload={'title':'Recorded stream','duration':35159,'live_status':'was_live','formats':[{'height':720,'vcodec':'avc1'}]}
+        url='https://www.youtube.com/watch?v=irNhWMG560k'
+        service.CACHE.clear()
+        with patch.object(service.subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout=json.dumps(payload))), patch.object(service,'quality_sizes',return_value={}), patch.object(service,'audio_options',return_value=[]):
+            self.assertEqual(service.info(url)['duration'],35159)
+        service.CACHE.clear();payload['duration']=43201
+        with patch.object(service.subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout=json.dumps(payload))):
+            with self.assertRaisesRegex(ValueError,'twelve hours'):service.info(url)
     def test_private_errors(self):
         self.assertNotIn('googlevideo',service.friendly_error('failed https://googlevideo.com/secret'))
     def test_authentication_and_range(self):

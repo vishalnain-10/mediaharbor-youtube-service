@@ -123,8 +123,8 @@ def info(value):
         data = json.loads(result.stdout)
         if data.get('is_live') or data.get('live_status') in ('is_upcoming', 'post_live'):
             raise ValueError('Live and upcoming streams are not supported. Try a completed public video.')
-        if (data.get('duration') or 0) > 4 * 3600:
-            raise ValueError('This service supports videos up to four hours long.')
+        if (data.get('duration') or 0) > 12 * 3600:
+            raise ValueError('This service supports videos up to twelve hours long.')
         heights = sorted({int(f['height']) for f in data.get('formats', []) if f.get('height') and f.get('vcodec') != 'none' and f.get('height') <= 2160}, reverse=True)
         if not heights:
             raise ValueError('No downloadable video formats are available for this video.')
