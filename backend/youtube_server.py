@@ -131,7 +131,7 @@ def info(value):
         heights = sorted({int(f['height']) for f in data.get('formats', []) if f.get('height') and f.get('vcodec') != 'none' and f.get('height') <= 2160}, reverse=True)
         if not heights:
             raise ValueError('No downloadable video formats are available for this video.')
-        output = {'videoId': vid, 'title': data.get('title', vid), 'thumbnail': 'https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg', 'duration': data.get('duration'), 'qualities': heights, 'qualitySizes': quality_sizes(data, heights), 'audioOptions': audio_options(data), 'sourceUrl': 'https://www.youtube.com/watch?v=' + vid}
+        output = {'videoId': vid, 'title': data.get('title', vid), 'thumbnail': 'https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg', 'duration': data.get('duration'), 'qualities': heights, 'maxFileBytes': MAX_BYTES, 'qualitySizes': quality_sizes(data, heights), 'audioOptions': audio_options(data), 'sourceUrl': 'https://www.youtube.com/watch?v=' + vid}
         with LOCK:
             if len(CACHE) > 100:
                 CACHE.clear()
@@ -275,6 +275,10 @@ def create_job(value, quality, mode='video', audio_format='mp3', bitrate=192):
     cap = None if mode == 'audio' else max(data['qualities']) if quality == 'original' else int(quality)
     if mode == 'video' and (cap not in data['qualities'] or cap > 2160):
         raise ValueError('Choose one of the video’s available resolutions, up to 2160p.')
+    if mode == 'video':
+        estimated = data.get('qualitySizes',{}).get(str(cap))
+        if estimated and estimated > MAX_BYTES:
+            raise ValueError('This resolution exceeds the file-size limit. Choose a lower quality or audio only.')
     with LOCK:
         matching = [dict(existing) for existing in JOBS.values() if existing.get('videoId') == data['videoId'] and existing.get('mode', 'video') == mode and existing.get('height') == cap and existing.get('extension', 'mp4') == (audio_format if mode == 'audio' else 'mp4') and (mode != 'audio' or audio_format != 'mp3' or existing.get('bitrate') == bitrate)]
     for existing in sorted(matching, key=lambda item:item.get('updated',0), reverse=True):

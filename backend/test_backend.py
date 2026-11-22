@@ -96,6 +96,14 @@ class BackendTests(unittest.TestCase):
         self.assertFalse(service.valid_download_ticket(token+'x',key))
         self.assertFalse(service.valid_download_ticket(service.download_ticket(state,expires=int(service.time.time())-1),key))
         (folder/'video.mp4').write_bytes(b'changed');self.assertFalse(service.valid_download_ticket(token,key))
+    def test_cropped_quality_and_oversize_selection(self):
+        metadata={'qualities':[2140,1426,1070,714,142],'videoId':'169ZzvPxvvM','title':'cropped','qualitySizes':{'2140':14557089670,'1070':3103664841}}
+        with patch.object(service,'info',return_value=metadata),patch.object(service.POOL,'submit') as submit:
+            with self.assertRaisesRegex(ValueError,'file-size limit'):service.create_job('https://youtu.be/169ZzvPxvvM','2140')
+            submit.assert_not_called()
+            try:
+                result=service.create_job('https://youtu.be/169ZzvPxvvM','1070');self.assertEqual(result['height'],1070)
+            finally:service.SLOTS.release();service.JOBS.pop(result['id'],None)
     def test_private_errors(self):
         self.assertNotIn('googlevideo',service.friendly_error('failed https://googlevideo.com/secret'))
     def test_authentication_and_range(self):
