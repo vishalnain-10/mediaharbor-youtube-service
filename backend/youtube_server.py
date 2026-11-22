@@ -1,4 +1,6 @@
 """Private yt-dlp/FFmpeg job service. Only the Sites server holds its API key."""
+import base64
+import hashlib
 import copy
 import concurrent.futures
 import contextlib
@@ -144,6 +146,27 @@ def media_path(data):
     if extension not in ('mp3', 'm4a', 'mp4') or not re.fullmatch(r'[0-9a-f]{32}', data.get('id', '')):
         raise ValueError('Invalid prepared file metadata.')
     return ROOT / data['id'] / (('audio.' if data.get('mode') == 'audio' else 'video.') + extension)
+
+
+def download_ticket(data, expires=None):
+    payload = {'job':data['id'],'expires':int(time.time())+14400 if expires is None else expires,'size':media_path(data).stat().st_size,'scope':'file'}
+    encoded = base64.urlsafe_b64encode(json.dumps(payload,separators=(',',':')).encode()).rstrip(b'=')
+    signature = hmac.new(TOKEN.encode(),encoded,hashlib.sha256).digest()
+    return encoded.decode()+'.'+base64.urlsafe_b64encode(signature).rstrip(b'=').decode()
+
+
+def valid_download_ticket(value, job_id):
+    try:
+        if not value or len(value)>2048: return False
+        encoded,signature=value.split('.')
+        expected=base64.urlsafe_b64encode(hmac.new(TOKEN.encode(),encoded.encode(),hashlib.sha256).digest()).rstrip(b'=').decode()
+        if not hmac.compare_digest(signature,expected): return False
+        payload=json.loads(base64.urlsafe_b64decode(encoded+'='*(-len(encoded)%4)))
+        if payload.get('scope')!='file' or payload.get('job')!=job_id or payload.get('expires',0)<time.time(): return False
+        data=job(job_id)
+        return data['status']=='ready' and media_path(data).stat().st_size==payload.get('size')
+    except (ValueError,TypeError,OSError):
+        return False
 
 
 def folder_bytes(folder):
@@ -307,7 +330,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.path == '/health':
             return self.send_json({'ok': True})
         if not self.authorized():
-            return self.send_json({'error': 'Unauthorized'}, 401)
+            file_match=re.fullmatch(r'/jobs/([0-9a-f]{32})/file',path.path)
+            ticket=parse_qs(path.query).get('ticket',[''])[0]
+            if not file_match or not valid_download_ticket(ticket,file_match[1]):
+                return self.send_json({'error':'This download link expired or is invalid. Open MediaHarbor to get a fresh link.' if ticket else 'Unauthorized'},401)
         try:
             if path.path == '/connection':
                 with LOCK:
@@ -350,6 +376,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({'ok': True})
             except Exception:
                 return self.send_json({'error': 'Invalid helper registration.'}, 400)
+        ticket_match=re.fullmatch(r'/jobs/([0-9a-f]{32})/ticket',self.path)
+        if ticket_match:
+            try:
+                length=int(self.headers.get('Content-Length',0))
+                if not 0<=length<=4096: raise ValueError('Invalid request size.')
+                if length:self.rfile.read(length)
+                data=job(ticket_match[1])
+                if data['status']!='ready':return self.send_json({'error':'This file is not ready.'},409)
+                set_job(data['id'])
+                return self.send_json({'ticket':download_ticket(data),'expiresIn':14400})
+            except (ValueError,OSError):return self.send_json({'error':'This download expired. Prepare it again.'},400)
         if self.path != '/jobs':
             return self.send_json({'error': 'Not found'}, 404)
         try:

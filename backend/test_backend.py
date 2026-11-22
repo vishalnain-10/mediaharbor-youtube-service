@@ -87,6 +87,15 @@ class BackendTests(unittest.TestCase):
             try:
                 result=service.create_job('https://youtu.be/HnRNXGKqNIE','720');self.assertEqual(result['id'],key);self.assertEqual(result['status'],'queued');self.assertIsNone(result['error']);self.assertEqual(submit.call_args.args[1],key)
             finally:service.SLOTS.release();service.JOBS.pop(key,None)
+    def test_download_tickets_are_scoped_and_expire(self):
+        key='d'*32;folder=Path(scratch.name)/key;folder.mkdir(exist_ok=True);(folder/'video.mp4').write_bytes(b'video'*256)
+        state={'id':key,'status':'ready','videoId':'HnRNXGKqNIE','mode':'video','height':1080,'extension':'mp4','size':1280,'updated':service.time.time()};service.JOBS[key]=state
+        token=service.download_ticket(state)
+        self.assertTrue(service.valid_download_ticket(token,key))
+        self.assertFalse(service.valid_download_ticket(token,'e'*32))
+        self.assertFalse(service.valid_download_ticket(token+'x',key))
+        self.assertFalse(service.valid_download_ticket(service.download_ticket(state,expires=int(service.time.time())-1),key))
+        (folder/'video.mp4').write_bytes(b'changed');self.assertFalse(service.valid_download_ticket(token,key))
     def test_private_errors(self):
         self.assertNotIn('googlevideo',service.friendly_error('failed https://googlevideo.com/secret'))
     def test_authentication_and_range(self):
@@ -98,6 +107,12 @@ class BackendTests(unittest.TestCase):
         try:
             with self.assertRaises(HTTPError) as error:urlopen(base+'/info?url=x')
             self.assertEqual(error.exception.code,401)
+            issue=Request(base+'/jobs/'+job_id+'/ticket',data=b'{}',headers={'Authorization':'Bearer '+service.TOKEN,'Content-Type':'application/json'})
+            with urlopen(issue) as response:ticket=json.load(response)['ticket']
+            signed=base+'/jobs/'+job_id+'/file?ticket='+ticket
+            with urlopen(Request(signed,headers={'Range':'bytes=0-9'})) as response:self.assertEqual(response.status,206);self.assertEqual(response.read(),b'0123456789')
+            with self.assertRaises(HTTPError) as denied:urlopen(base+'/jobs/'+job_id+'?ticket='+ticket)
+            self.assertEqual(denied.exception.code,401);denied.exception.close()
             req=Request(base+'/jobs/'+job_id+'/file',headers={'Authorization':'Bearer '+service.TOKEN,'Range':'bytes=10-19'})
             with urlopen(req) as response:
                 self.assertEqual(response.status,206);self.assertEqual(response.read(),b'0123456789');self.assertEqual(response.headers['Content-Range'],'bytes 10-19/10240');etag=response.headers['ETag']
